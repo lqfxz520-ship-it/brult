@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="在浏览器中调整 PDF 页面顺序、方向和页数。">
+  <title>PDF 页面调整</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #20242b; background: #f5f6f8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; }
+    header { background: #fff; border-bottom: 1px solid #e5e7eb; }
+    .bar, main { width: min(1040px, calc(100% - 32px)); margin: auto; }
+    .bar { min-height: 64px; display: flex; align-items: center; gap: 10px; font-weight: 700; }
+    .logo { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; color: white; background: #315efb; }
+    main { padding: 42px 0 64px; }
+    h1 { margin: 0 0 8px; font-size: clamp(26px, 4vw, 34px); }
+    .intro { margin: 0 0 26px; color: #69707c; }
+    .panel { padding: 24px; background: white; border: 1px solid #e5e7eb; border-radius: 14px; box-shadow: 0 4px 18px #18223008; }
+    .drop { min-height: 190px; display: grid; place-items: center; border: 2px dashed #cdd3df; border-radius: 12px; background: #fafbfc; text-align: center; padding: 24px; }
+    .drop.drag { border-color: #315efb; background: #f3f6ff; }
+    .drop p { margin: 0 0 14px; color: #69707c; }
+    button, .pick { border: 0; border-radius: 8px; padding: 10px 15px; background: #315efb; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+    button:hover, .pick:hover { background: #244bd1; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    .pick input { display: none; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 20px 0; }
+    .toolbar .secondary, .page-actions button { color: #293142; background: #eef1f5; }
+    .toolbar .secondary:hover, .page-actions button:hover { background: #e1e6ee; }
+    .filename { color: #69707c; margin-right: auto; overflow-wrap: anywhere; }
+    .pages { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 16px; }
+    .page { min-width: 0; padding: 12px; border: 1px solid #e5e7eb; border-radius: 10px; background: #fff; }
+    .preview { height: 220px; display: grid; place-items: center; overflow: hidden; background: #f3f4f6; border-radius: 6px; }
+    canvas { max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 2px 8px #0002; background: #fff; }
+    .page-info { display: flex; justify-content: space-between; gap: 8px; margin: 10px 0; font-size: 14px; font-weight: 600; }
+    .page-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .page-actions button { padding: 7px 9px; font-size: 13px; }
+    .page-actions .remove { color: #a12d35; background: #fff0f0; }
+    .page-actions .remove:hover { background: #ffe2e2; }
+    .status { min-height: 24px; margin-top: 14px; color: #596273; font-size: 14px; }
+    .status.error { color: #b42318; }
+    .empty { display: none; padding: 30px; color: #69707c; text-align: center; }
+    .footnote { margin: 18px 2px 0; color: #7a8290; font-size: 13px; }
+    @media (max-width: 600px) { main { padding-top: 28px; } .panel { padding: 16px; } .toolbar { align-items: stretch; } .filename { width: 100%; } .pages { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .page { padding: 8px; } .preview { height: 170px; } }
+  </style>
+</head>
+<body>
+  <header><div class="bar"><span class="logo">PDF</span><span>简易 PDF 工具</span></div></header>
+  <main>
+    <h1>调整 PDF 页面</h1>
+    <p class="intro">旋转、删除或重新排列页面，完成后下载调整好的 PDF。</p>
+    <section class="panel">
+      <div class="drop" id="dropzone">
+        <div><p>将 PDF 文件拖到这里，或从设备中选择</p><label class="pick">选择 PDF 文件<input id="file" type="file" accept="application/pdf,.pdf"></label></div>
+      </div>
+      <div class="toolbar" id="toolbar" hidden>
+        <span class="filename" id="filename"></span>
+        <button class="secondary" id="reset">重新选择</button>
+        <button id="save">保存并下载 PDF</button>
+      </div>
+      <div class="pages" id="pages"></div>
+      <div class="empty" id="empty">所有页面都已删除。请重新选择文件。</div>
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+    </section>
+    <p class="footnote">文件只在当前浏览器中处理，不会上传到服务器。</p>
+  </main>
+  <script>
+    (() => {
+      const { PDFDocument, degrees } = PDFLib;
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      const $ = id => document.getElementById(id);
+      const fileInput = $('file'), zone = $('dropzone'), pagesEl = $('pages'), status = $('status');
+      let sourceBytes = null, sourceName = '', pages = [], busy = false;
+      function message(text, error = false) { status.textContent = text; status.classList.toggle('error', error); }
+      function updateEmpty() { $('empty').style.display = sourceBytes && pages.length === 0 ? 'block' : 'none'; }
+      function swap(i, j) { if (j < 0 || j >= pages.length) return; [pages[i], pages[j]] = [pages[j], pages[i]]; renderList(); }
+      function renderList() {
+        pagesEl.replaceChildren();
+        pages.forEach((page, index) => {
+          const card = document.createElement('article'); card.className = 'page';
+          const preview = document.createElement('div'); preview.className = 'preview';
+          const canvas = document.createElement('canvas'); canvas.setAttribute('aria-label', `第 ${index + 1} 页预览`); preview.append(canvas);
+          const info = document.createElement('div'); info.className = 'page-info';
+          const label = document.createElement('span'); label.textContent = `第 ${index + 1} 页`;
+          const origin = document.createElement('span'); origin.textContent = `原第 ${page.index + 1} 页`; origin.style.color = '#7a8290';
+          info.append(label, origin);
+          const actions = document.createElement('div'); actions.className = 'page-actions';
+          const add = (text, title, fn, cls = '') => { const b = document.createElement('button'); b.textContent = text; b.title = title; b.setAttribute('aria-label', title); if (cls) b.className = cls; b.onclick = fn; actions.append(b); };
+          add('左转', '向左旋转 90 度', () => { page.rotation = (page.rotation + 270) % 360; renderList(); });
+          add('右转', '向右旋转 90 度', () => { page.rotation = (page.rotation + 90) % 360; renderList(); });
+          add('上移', '向前移动一页', () => swap(index, index - 1));
+          add('下移', '向后移动一页', () => swap(index, index + 1));
+          add('删除', '删除此页', () => { pages.splice(index, 1); renderList(); updateEmpty(); message(`已删除页面。当前剩余 ${pages.length} 页。`); }, 'remove');
+          card.append(preview, info, actions); pagesEl.append(card);
+          page.render(canvas, preview.clientWidth || 170).catch(() => {});
+        });
+        updateEmpty();
+      }
+      async function load(file) {
+        if (!file || file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) { message('请选择有效的 PDF 文件。', true); return; }
+        try {
+          busy = true; message('正在读取并生成页面预览…');
+          sourceBytes = await file.arrayBuffer(); sourceName = file.name;
+          const doc = await pdfjsLib.getDocument({ data: sourceBytes.slice(0) }).promise;
+          pages = [];
+          for (let i = 1; i <= doc.numPages; i++) {
+            const pdfPage = await doc.getPage(i);
+            pages.push({ index: i - 1, rotation: 0, render: async (canvas, maxWidth) => {
+              const rotation = (pdfPage.rotate + pages.find(p => p.index === i - 1).rotation + 360) % 360;
+              const viewport = pdfPage.getViewport({ scale: 1, rotation });
+              const scale = Math.min(maxWidth / viewport.width, 210 / viewport.height, 1.4);
+              const scaled = pdfPage.getViewport({ scale, rotation });
+              canvas.width = Math.ceil(scaled.width * devicePixelRatio); canvas.height = Math.ceil(scaled.height * devicePixelRatio);
+              canvas.style.width = `${Math.ceil(scaled.width)}px`; canvas.style.height = `${Math.ceil(scaled.height)}px`;
+              await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport: scaled, transform: devicePixelRatio === 1 ? null : [devicePixelRatio, 0, 0, devicePixelRatio, 0, 0] }).promise;
+            }});
+          }
+          $('filename').textContent = `${file.name} · ${doc.numPages} 页`;
+          zone.hidden = true; $('toolbar').hidden = false; renderList(); message('预览已就绪。使用页面按钮调整顺序、方向或删除页面。');
+        } catch (e) { sourceBytes = null; pages = []; message('无法读取这个 PDF。请确认文件未损坏且未受密码保护。', true); console.error(e); }
+        finally { busy = false; }
+      }
+      fileInput.addEventListener('change', e => load(e.target.files[0]));
+      for (const event of ['dragenter', 'dragover']) zone.addEventListener(event, e => { e.preventDefault(); zone.classList.add('drag'); });
+      for (const event of ['dragleave', 'drop']) zone.addEventListener(event, e => { e.preventDefault(); zone.classList.remove('drag'); });
+      zone.addEventListener('drop', e => load(e.dataTransfer.files[0]));
+      $('reset').onclick = () => { sourceBytes = null; sourceName = ''; pages = []; fileInput.value = ''; pagesEl.replaceChildren(); zone.hidden = false; $('toolbar').hidden = true; message(''); updateEmpty(); };
+      $('save').onclick = async () => {
+        if (busy || !sourceBytes || pages.length === 0) return;
+        try {
+          busy = true; $('save').disabled = true; message('正在生成 PDF…');
+          const original = await PDFDocument.load(sourceBytes);
+          const output = await PDFDocument.create();
+          const copied = await output.copyPages(original, pages.map(p => p.index));
+          copied.forEach((p, i) => { p.setRotation(degrees((p.getRotation().angle + pages[i].rotation + 360) % 360)); output.addPage(p); });
+          const bytes = await output.save();
+          const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+          const a = document.createElement('a'); a.href = url; a.download = sourceName.replace(/\.pdf$/i, '') + '-已调整.pdf'; a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000); message('已生成并下载调整后的 PDF。');
+        } catch (e) { message('保存失败。文件可能受密码保护或包含不受支持的内容。', true); console.error(e); }
+        finally { busy = false; $('save').disabled = false; }
+      };
+    })();
+  </script>
+</body>
+</html>
+
