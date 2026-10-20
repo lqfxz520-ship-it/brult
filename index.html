@@ -43,7 +43,29 @@
     .status.error { color: #b42318; }
     .empty { display: none; padding: 30px; color: #69707c; text-align: center; }
     .footnote { margin: 18px 2px 0; color: #7a8290; font-size: 13px; }
+    .question-section { margin-top: 42px; }
+    .question-section h2 { margin: 0 0 8px; font-size: 24px; }
+    .question-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 18px 0; }
+    .question-controls .secondary, .question-card button, .saved-row button { color: #293142; background: #eef1f5; }
+    .question-controls .secondary:hover, .question-card button:hover, .saved-row button:hover { background: #e1e6ee; }
+    .question-status { min-height: 24px; color: #596273; font-size: 14px; }
+    .question-status.error { color: #b42318; }
+    .question-preview-wrap { position: relative; display: inline-block; max-width: 100%; margin: 10px auto 18px; line-height: 0; touch-action: none; }
+    .question-preview-wrap canvas { display: block; max-width: 100%; height: auto; }
+    #qoverlay { position: absolute; inset: 0; cursor: crosshair; }
+    #qselection { position: absolute; display: none; border: 2px solid #315efb; background: #315efb33; pointer-events: none; }
+    .question-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; align-items: start; }
+    .question-page { overflow: auto; text-align: center; min-height: 200px; background: #f3f4f6; border-radius: 10px; padding: 16px; }
+    .question-list { display: grid; gap: 10px; }
+    .question-card, .saved-row { padding: 10px; border: 1px solid #e5e7eb; border-radius: 9px; background: #fff; }
+    .question-card img { display: block; max-width: 100%; max-height: 210px; margin: 0 auto 8px; object-fit: contain; }
+    .question-card p { margin: 4px 0 8px; color: #69707c; font-size: 13px; }
+    .question-card button, .saved-row button { padding: 6px 8px; font-size: 12px; margin: 0 4px 0 0; }
+    .saved-list { display: grid; gap: 8px; margin-top: 10px; }
+    .saved-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .saved-row small { color: #69707c; display: block; margin-top: 3px; }
     @media (max-width: 600px) { main { padding-top: 28px; } .panel { padding: 16px; } .toolbar { align-items: stretch; } .filename { width: 100%; } .pages { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .page { padding: 8px; } .preview { height: 170px; } }
+    @media (max-width: 760px) { .question-workspace { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -65,6 +87,30 @@
       <div class="status" id="status" role="status" aria-live="polite"></div>
     </section>
     <p class="footnote">文件只在当前浏览器中处理，不会上传到服务器。</p>
+
+    <section class="question-section">
+      <h2>题目整理</h2>
+      <p class="intro">在 PDF 页面上拖动鼠标框选题目，再调整顺序或保存到本机题库。</p>
+      <section class="panel">
+        <label class="pick">选择题目 PDF<input id="qfile" type="file" accept="application/pdf,.pdf"></label>
+        <span id="qfilename" class="filename" style="margin-left:10px"></span>
+        <div class="question-controls" id="qcontrols" hidden>
+          <button class="secondary" id="qprev">上一页</button><span id="qpageinfo"></span><button class="secondary" id="qnext">下一页</button>
+          <button class="secondary" id="qclear">清空已选</button>
+          <button id="qadd">添加选框中的题目</button>
+          <button class="secondary" id="qsave">保存到本机题库</button>
+          <button class="secondary" id="qexport">下载编排后的 PDF</button>
+        </div>
+        <div id="qstatus" class="question-status" role="status" aria-live="polite">选择 PDF 后，在页面上拖动鼠标框选一题。</div>
+        <div class="question-workspace">
+          <div class="question-page" id="qpage"><div id="qwrap" class="question-preview-wrap" hidden><canvas id="qcanvas"></canvas><div id="qoverlay"><div id="qselection"></div></div></div></div>
+          <div><strong>已选题目 <span id="qcount">0</span></strong><div id="qlist" class="question-list" style="margin-top:10px"></div></div>
+        </div>
+        <hr style="border:0;border-top:1px solid #e5e7eb;margin:22px 0">
+        <strong>本机题库</strong><div id="qdb-list" class="saved-list"></div>
+        <p class="footnote">PDF 页面和题目只在当前浏览器中处理；题库保存在当前浏览器的本机数据库中，换浏览器或清除浏览数据后不会自动同步。</p>
+      </section>
+    </section>
   </main>
   <script>
     (() => {
@@ -142,6 +188,110 @@
         } catch (e) { message('保存失败。文件可能受密码保护或包含不受支持的内容。', true); console.error(e); }
         finally { busy = false; $('save').disabled = false; }
       };
+    })();
+  </script>
+  <script>
+    (() => {
+      const { PDFDocument, degrees } = PDFLib;
+      const $ = id => document.getElementById(id);
+      const status = $('qstatus'), overlay = $('qoverlay'), selection = $('qselection'), canvas = $('qcanvas');
+      const dbName = 'brult-question-bank';
+      let pdfDoc = null, pdfBytes = null, fileName = '', pageNo = 1, items = [], dragStart = null, currentRect = null, db = null;
+      const say = (text, error = false) => { status.textContent = text; status.classList.toggle('error', error); };
+      function openDB() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(dbName, 1);
+          request.onupgradeneeded = () => request.result.createObjectStore('collections', { keyPath: 'id' });
+          request.onsuccess = () => { db = request.result; resolve(db); };
+          request.onerror = () => reject(request.error);
+        });
+      }
+      function transaction(mode = 'readonly') { return db.transaction('collections', mode).objectStore('collections'); }
+      async function refreshSaved() {
+        const rows = await new Promise((resolve, reject) => { const req = transaction().getAll(); req.onsuccess = () => resolve(req.result || []); req.onerror = () => reject(req.error); });
+        const list = $('qdb-list'); list.replaceChildren();
+        rows.sort((a, b) => b.savedAt - a.savedAt).forEach(row => {
+          const item = document.createElement('div'); item.className = 'saved-row';
+          const info = document.createElement('div'); info.textContent = row.name;
+          const small = document.createElement('small'); small.textContent = `${row.items.length} 道题 · ${new Date(row.savedAt).toLocaleString()}`; info.append(small);
+          const load = document.createElement('button'); load.textContent = '载入'; load.onclick = () => { items = row.items; renderItems(); say(`已载入“${row.name}”。`); };
+          item.append(info, load); list.append(item);
+        });
+        if (!rows.length) list.textContent = '还没有保存的题目集。';
+      }
+      function renderItems() {
+        const list = $('qlist'); list.replaceChildren(); $('qcount').textContent = String(items.length);
+        items.forEach((q, i) => {
+          const card = document.createElement('article'); card.className = 'question-card';
+          const img = document.createElement('img'); img.src = q.image; img.alt = `题目 ${i + 1}`;
+          const caption = document.createElement('p'); caption.textContent = `题目 ${i + 1} · 第 ${q.page} 页`;
+          const actions = document.createElement('div');
+          const button = (label, action) => { const b = document.createElement('button'); b.textContent = label; b.onclick = action; actions.append(b); };
+          button('上移', () => move(i, i - 1)); button('下移', () => move(i, i + 1));
+          button('移除', () => { items.splice(i, 1); renderItems(); say('已从当前编排中移除。'); });
+          card.append(img, caption, actions); list.append(card);
+        });
+      }
+      function move(i, j) { if (j < 0 || j >= items.length) return; [items[i], items[j]] = [items[j], items[i]]; renderItems(); }
+      async function renderPage() {
+        const page = await pdfDoc.getPage(pageNo), natural = page.getViewport({ scale: 1 });
+        const availableWidth = Math.max(240, $('qpage').clientWidth - 32);
+        const scale = Math.min(availableWidth / natural.width, 1100 / natural.height, 1.6), viewport = page.getViewport({ scale });
+        canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
+        canvas.style.width = `${canvas.width}px`; canvas.style.height = `${canvas.height}px`;
+        overlay.style.width = `${canvas.width}px`; overlay.style.height = `${canvas.height}px`;
+        selection.style.display = 'none'; currentRect = null;
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        $('qpageinfo').textContent = `第 ${pageNo} / ${pdfDoc.numPages} 页`;
+        $('qprev').disabled = pageNo <= 1; $('qnext').disabled = pageNo >= pdfDoc.numPages;
+      }
+      $('qfile').addEventListener('change', async e => {
+        const file = e.target.files[0]; if (!file) return;
+        try {
+          say('正在打开 PDF…'); fileName = file.name; pdfBytes = await file.arrayBuffer();
+          pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes.slice(0) }).promise; pageNo = 1;
+          $('qfilename').textContent = fileName; $('qcontrols').hidden = false; $('qwrap').hidden = false;
+          await renderPage(); say('拖动鼠标框选一道题，然后点击“添加选框中的题目”。');
+        } catch (err) { say('无法读取 PDF。文件可能损坏或受密码保护。', true); console.error(err); }
+      });
+      $('qprev').onclick = async () => { if (pageNo > 1) { pageNo--; await renderPage(); } };
+      $('qnext').onclick = async () => { if (pageNo < pdfDoc.numPages) { pageNo++; await renderPage(); } };
+      overlay.addEventListener('pointerdown', e => { const r = overlay.getBoundingClientRect(); dragStart = { x: e.clientX - r.left, y: e.clientY - r.top }; selection.style.left = `${dragStart.x}px`; selection.style.top = `${dragStart.y}px`; selection.style.width = '0'; selection.style.height = '0'; selection.style.display = 'block'; overlay.setPointerCapture(e.pointerId); });
+      overlay.addEventListener('pointermove', e => { if (!dragStart) return; const r = overlay.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top; currentRect = { x: Math.min(x, dragStart.x), y: Math.min(y, dragStart.y), w: Math.abs(x - dragStart.x), h: Math.abs(y - dragStart.y) }; Object.assign(selection.style, { left: `${currentRect.x}px`, top: `${currentRect.y}px`, width: `${currentRect.w}px`, height: `${currentRect.h}px` }); });
+      overlay.addEventListener('pointerup', () => { dragStart = null; if (currentRect && currentRect.w > 12 && currentRect.h > 12) say('选区已就绪。确认后点击“添加选框中的题目”。'); else { currentRect = null; selection.style.display = 'none'; } });
+      $('qadd').onclick = () => {
+        if (!currentRect) { say('请先在页面上拖动鼠标框选题目。', true); return; }
+        const x = Math.max(0, Math.floor(currentRect.x)), y = Math.max(0, Math.floor(currentRect.y));
+        const w = Math.min(canvas.width - x, Math.ceil(currentRect.w)), h = Math.min(canvas.height - y, Math.ceil(currentRect.h));
+        if (w <= 0 || h <= 0) return;
+        const crop = document.createElement('canvas'); crop.width = w; crop.height = h; crop.getContext('2d').drawImage(canvas, x, y, w, h, 0, 0, w, h);
+        items.push({ image: crop.toDataURL('image/png'), page: pageNo, source: fileName }); renderItems();
+        selection.style.display = 'none'; currentRect = null; say(`已添加题目。当前共 ${items.length} 道，可调整顺序。`);
+      };
+      $('qclear').onclick = () => { items = []; renderItems(); say('已清空当前编排。'); };
+      $('qsave').onclick = async () => {
+        if (!items.length) { say('请先至少添加一道题。', true); return; }
+        try {
+          const name = `${fileName.replace(/\.pdf$/i, '')} 题目集`;
+          const record = { id: crypto.randomUUID(), name, savedAt: Date.now(), items: structuredClone(items) };
+          await new Promise((resolve, reject) => { const req = transaction('readwrite').put(record); req.onsuccess = resolve; req.onerror = () => reject(req.error); });
+          await refreshSaved(); say(`已将 ${items.length} 道题保存到本机题库。`);
+        } catch (err) { say('保存失败。浏览器可能已限制本机存储空间。', true); console.error(err); }
+      };
+      $('qexport').onclick = async () => {
+        if (!items.length) { say('请先至少添加一道题。', true); return; }
+        try {
+          const out = await PDFDocument.create();
+          for (const q of items) {
+            const raw = atob(q.image.split(',')[1]), bytes = Uint8Array.from(raw, c => c.charCodeAt(0)), png = await out.embedPng(bytes);
+            const page = out.addPage([595, 842]), scale = Math.min(555 / png.width, 780 / png.height);
+            page.drawImage(png, { x: (595 - png.width * scale) / 2, y: (842 - png.height * scale) / 2, width: png.width * scale, height: png.height * scale });
+          }
+          const blob = new Blob([await out.save()], { type: 'application/pdf' }), url = URL.createObjectURL(blob), a = document.createElement('a');
+          a.href = url; a.download = `${fileName.replace(/\.pdf$/i, '')}-题目编排.pdf`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); say('已下载按当前顺序编排的 PDF。');
+        } catch (err) { say('生成 PDF 失败。', true); console.error(err); }
+      };
+      openDB().then(refreshSaved).catch(err => { say('本机题库不可用，请检查浏览器存储设置。', true); console.error(err); });
     })();
   </script>
 </body>
